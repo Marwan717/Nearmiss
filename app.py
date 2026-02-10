@@ -3,6 +3,7 @@ import os
 import tempfile
 from collections import deque
 from itertools import combinations
+import math
 
 import streamlit as st
 import numpy as np
@@ -11,17 +12,13 @@ import cv2
 from ultralytics import YOLO
 
 # =========================
-# DEBUG CHECK (remove later)
-# =========================
-st.write("Python version:", sys.version)
-
-# =========================
 # CONFIG
 # =========================
 CAR_CLASS_ID = 2
-NEAR_MISS_THRESHOLD_SEC = 4.0
-MAX_TRACK_AGE = 20
 MATCH_DIST_PX = 60
+MAX_TRACK_AGE = 20
+NEAR_MISS_PET_S = 4.0
+FPS_FALLBACK = 30.0
 
 # =========================
 # UTILS
@@ -33,6 +30,16 @@ def bb_centroid(bb):
 def make_writer(path, fps, w, h):
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     return cv2.VideoWriter(path, fourcc, fps, (w, h))
+
+def speed_px_per_s(hist, fps):
+    if len(hist) < 2:
+        return 0.0
+    f0, x0, y0 = hist[-2]
+    f1, x1, y1 = hist[-1]
+    dt = (f1 - f0) / fps
+    if dt <= 0:
+        return 0.0
+    return math.hypot(x1 - x0, y1 - y0) / dt
 
 # =========================
 # TRACKER
@@ -51,7 +58,7 @@ class Tracker:
             matched_id = None
 
             for tid, tr in self.tracks.items():
-                dist = np.hypot(cx - tr["cx"], cy - tr["cy"])
+                dist = math.hypot(cx - tr["cx"], cy - tr["cy"])
                 if dist < MATCH_DIST_PX:
                     matched_id = tid
                     break
@@ -65,7 +72,7 @@ class Tracker:
                     "cy": cy,
                     "bbox": det["bbox"],
                     "last_frame": frame_idx,
-                    "hist": deque(maxlen=120),
+                    "hist": deque(maxlen=30),
                 }
             else:
                 tr = self.tracks[matched_id]
@@ -84,54 +91,33 @@ class Tracker:
         return self.tracks
 
 # =========================
-# NEAR MISS DETECTOR
+# SAFETY METRICS
 # =========================
-class NearMissDetector:
-    def __init__(self, zone):
-        self.zone = zone
-        self.events = []
-        self.logged_pairs = set()
+def compute_ttc(p1, v1, p2, v2):
+    rel_pos = np.array(p2) - np.array(p1)
+    rel_vel = np.array(v2) - np.array(v1)
+    denom = np.dot(rel_vel, rel_vel)
+    if denom <= 1e-6:
+        return None
+    ttc = -np.dot(rel_pos, rel_vel) / denom
+    return ttc if ttc > 0 else None
 
-    def in_zone(self, x, y):
-        return (
-            self.zone["xmin"] <= x <= self.zone["xmax"]
-            and self.zone["ymin"] <= y <= self.zone["ymax"]
-        )
-
-    def check(self, tracks, frame_idx, fps):
-        active = []
-
-        for tr in tracks.values():
-            if len(tr["hist"]) < 2:
-                continue
-            _, x, y = tr["hist"][-1]
-            if self.in_zone(x, y):
-                active.append(tr)
-
-        for a, b in combinations(active, 2):
-            pair = tuple(sorted([a["id"], b["id"]]))
-            if pair in self.logged_pairs:
-                continue
-
-            fa = a["hist"][-1][0]
-            fb = b["hist"][-1][0]
-            pet = abs(fa - fb) / fps
-
-            if pet <= NEAR_MISS_THRESHOLD_SEC:
-                self.logged_pairs.add(pair)
-                self.events.append({
-                    "time_s": round(frame_idx / fps, 2),
-                    "car_1_id": a["id"],
-                    "car_2_id": b["id"],
-                    "pet_s": round(pet, 2),
-                    "event": "near_miss"
-                })
+def severity_score(pet, ttc, v1, v2):
+    score = 0
+    if pet is not None:
+        score += max(0, (4 - pet)) * 2
+    if ttc is not None:
+        score += max(0, (3 - ttc)) * 3
+    score += (v1 + v2) / 50
+    return round(score, 2)
 
 # =========================
 # STREAMLIT UI
 # =========================
 st.set_page_config(layout="wide")
-st.title("Vehicle Near-Miss Detection")
+st.title("Vehicle Near-Miss and Safety Analysis")
+
+st.write("Python:", sys.version)
 
 uploaded = st.file_uploader("Upload traffic video", type=["mp4", "mov", "avi"])
 
@@ -147,93 +133,143 @@ run = st.button("Run Analysis", type="primary")
 # MAIN
 # =========================
 if run and uploaded:
-    tmp = tempfile.mkdtemp()
-    video_path = os.path.join(tmp, uploaded.name)
+    with st.spinner("Running analysis this may take a minute"):
+        progress = st.progress(0.0)
+        frame_slot = st.empty()
 
-    with open(video_path, "wb") as f:
-        f.write(uploaded.getbuffer())
+        tmp = tempfile.mkdtemp()
+        video_path = os.path.join(tmp, uploaded.name)
+        with open(video_path, "wb") as f:
+            f.write(uploaded.getbuffer())
 
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps < 1:
-        fps = 30.0
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps < 1:
+            fps = FPS_FALLBACK
 
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    out_path = os.path.join(tmp, "annotated.mp4")
-    writer = make_writer(out_path, fps, w, h)
+        out_path = os.path.join(tmp, "annotated.mp4")
+        writer = make_writer(out_path, fps, w, h)
 
-    model = YOLO("yolov8n.pt")
-    tracker = Tracker(fps)
+        st.write("Loading YOLO model")
+        model = YOLO("yolov8n.pt")
+        st.write("Model loaded")
 
-    near_miss = NearMissDetector({
-        "xmin": zx1,
-        "xmax": zx2,
-        "ymin": zy1,
-        "ymax": zy2,
-    })
+        tracker = Tracker(fps)
+        events = []
+        logged_pairs = set()
 
-    frame_idx = 0
+        frame_idx = 0
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
 
-        result = model.predict(frame, conf=0.25, verbose=False)[0]
-        detections = []
+            res = model.predict(frame, conf=0.25, verbose=False)[0]
+            detections = []
 
-        if result.boxes is not None:
-            for bb, cls in zip(
-                result.boxes.xyxy.cpu().numpy(),
-                result.boxes.cls.cpu().numpy().astype(int),
-            ):
-                if cls == CAR_CLASS_ID:
-                    cx, cy = bb_centroid(bb)
-                    detections.append({"cx": cx, "cy": cy, "bbox": bb})
+            if res.boxes is not None:
+                for bb, cls in zip(
+                    res.boxes.xyxy.cpu().numpy(),
+                    res.boxes.cls.cpu().numpy().astype(int),
+                ):
+                    if cls == CAR_CLASS_ID:
+                        cx, cy = bb_centroid(bb)
+                        detections.append({"cx": cx, "cy": cy, "bbox": bb})
 
-        tracks = tracker.update(detections, frame_idx)
-        near_miss.check(tracks, frame_idx, fps)
+            tracks = tracker.update(detections, frame_idx)
 
-        # draw conflict zone
-        cv2.rectangle(
-            frame,
-            (int(zx1), int(zy1)),
-            (int(zx2), int(zy2)),
-            (0, 0, 255),
-            2,
-        )
+            active = []
+            for tr in tracks.values():
+                if zx1 <= tr["cx"] <= zx2 and zy1 <= tr["cy"] <= zy2:
+                    active.append(tr)
 
-        for tr in tracks.values():
-            x1, y1, x2, y2 = map(int, tr["bbox"])
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(
-                frame,
-                f"ID {tr['id']}",
-                (x1, y1 - 6),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (255, 255, 255),
-                2,
-            )
+            for a, b in combinations(active, 2):
+                pair = tuple(sorted([a["id"], b["id"]]))
+                if pair in logged_pairs:
+                    continue
 
-        writer.write(frame)
-        frame_idx += 1
+                pet = abs(a["hist"][-1][0] - b["hist"][-1][0]) / fps
+                if pet <= NEAR_MISS_PET_S:
+                    v1 = speed_px_per_s(a["hist"], fps)
+                    v2 = speed_px_per_s(b["hist"], fps)
 
-    cap.release()
-    writer.release()
+                    p1 = a["hist"][-1][1:]
+                    p2 = b["hist"][-1][1:]
 
-    df = pd.DataFrame(near_miss.events)
+                    ttc = compute_ttc(
+                        p1, (v1, v1),
+                        p2, (v2, v2),
+                    )
 
-    st.success("Analysis complete")
-    st.video(out_path)
-    st.dataframe(df)
+                    sev = severity_score(pet, ttc, v1, v2)
 
-    csv_path = os.path.join(tmp, "near_miss_events.csv")
+                    logged_pairs.add(pair)
+                    events.append({
+                        "time_s": round(frame_idx / fps, 2),
+                        "car_1": a["id"],
+                        "car_2": b["id"],
+                        "speed_1_px_s": round(v1, 2),
+                        "speed_2_px_s": round(v2, 2),
+                        "PET_s": round(pet, 2),
+                        "TTC_s": None if ttc is None else round(ttc, 2),
+                        "severity": sev,
+                    })
+
+            cv2.rectangle(frame, (zx1, zy1), (zx2, zy2), (0, 0, 255), 2)
+
+            for tr in tracks.values():
+                x1, y1, x2, y2 = map(int, tr["bbox"])
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(
+                    frame,
+                    f"ID {tr['id']}",
+                    (x1, y1 - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 255),
+                    2,
+                )
+
+            if frame_idx % 10 == 0:
+                frame_slot.image(frame, channels="BGR", use_container_width=True)
+
+            writer.write(frame)
+            progress.progress(min(frame_idx / total_frames, 1.0))
+            frame_idx += 1
+
+        cap.release()
+        writer.release()
+
+    df = pd.DataFrame(events)
+
+    # =========================
+    # TEXT ANALYSIS SUMMARY
+    # =========================
+    st.subheader("Safety Analysis Summary")
+
+    if len(df) == 0:
+        st.write("No near-miss events detected in the selected conflict zone.")
+    else:
+        st.write(f"Total near-miss events detected: {len(df)}")
+        st.write(f"Average severity score: {round(df['severity'].mean(), 2)}")
+        st.write(f"Minimum PET: {df['PET_s'].min()} seconds")
+        if df['TTC_s'].notna().any():
+            st.write(f"Minimum TTC: {df['TTC_s'].min()} seconds")
+
+    st.subheader("Detailed Events")
+    st.dataframe(df, use_container_width=True)
+
+    csv_path = os.path.join(tmp, "safety_events.csv")
     df.to_csv(csv_path, index=False)
+
+    st.video(out_path)
     st.download_button(
-        "Download Near-Miss CSV",
+        "Download CSV",
         open(csv_path, "rb"),
-        "near_miss_events.csv",
+        "safety_events.csv",
     )
