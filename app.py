@@ -1,83 +1,90 @@
-import sys
+import streamlit as st
 import cv2
 import math
 import time
+import tempfile
+import numpy as np
 import pandas as pd
 from ultralytics import YOLO
-from collections import defaultdict
+from collections import defaultdict, deque
 
-# =============================
-# CONFIG
-# =============================
-CONF_THRESH = 0.4
-VEHICLE_CLASSES = [2, 3, 5, 7]   # car, motorcycle, bus, truck
-NEAR_MISS_DIST = 60              # pixels
-TTC_THRESHOLD = 2.0              # seconds
-MAX_TABLE_ROWS = 5
+# ======================================================
+# STREAMLIT CONFIG
+# ======================================================
+st.set_page_config(layout="wide")
+st.title("Traffic Near-Miss Detection (TTC + PET)")
 
-OUTPUT_VIDEO = "output.mp4"
-OUTPUT_CSV = "near_miss_events.csv"
+# ======================================================
+# SIDEBAR CONTROLS
+# ======================================================
+st.sidebar.header("Calibration & Thresholds")
 
-# =============================
-# DRAW NEAR-MISS TABLE (SCREENSHOT FEATURE)
-# =============================
-def draw_near_miss_panel(frame, events):
-    x, y = 20, 40
-    row_h = 22
+meters_per_pixel = st.sidebar.number_input(
+    "Meters per pixel (camera calibration)",
+    min_value=0.001,
+    max_value=1.0,
+    value=20/600,
+    step=0.001
+)
 
-    cv2.rectangle(frame, (10, 10), (700, 200), (40, 40, 40), -1)
-    cv2.putText(frame, "Near miss - Near miss events",
-                (x, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                (255, 255, 255), 2)
+ttc_threshold = st.sidebar.slider("TTC threshold (s)", 0.5, 5.0, 2.0)
+pet_threshold = st.sidebar.slider("PET threshold (s)", 0.5, 5.0, 1.5)
 
-    headers = ["ID", "Safety", "Class 1", "Class 2", "Time"]
-    for i, h in enumerate(headers):
-        cv2.putText(frame, h,
-                    (x + i * 130, y + row_h),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                    (200, 200, 200), 1)
+uploaded_video = st.file_uploader("Upload traffic video", type=["mp4", "avi", "mov"])
+run_button = st.button("Run Analysis")
 
-    recent = events[-MAX_TABLE_ROWS:]
-    for r, e in enumerate(recent):
-        yy = y + (r + 2) * row_h
-        cv2.putText(frame, str(e["id"]), (x, yy),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
-        cv2.putText(frame, str(e["safety_indicator"]), (x + 130, yy),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
-        cv2.putText(frame, e["traj_1"], (x + 260, yy),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
-        cv2.putText(frame, e["traj_2"], (x + 390, yy),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
-        cv2.putText(frame, e["time"], (x + 520, yy),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+# ======================================================
+# GEOMETRY / SAFETY METRICS
+# ======================================================
+def velocity(p_prev, p_curr, dt, mpp):
+    if dt == 0:
+        return np.array([0.0, 0.0])
+    return (np.array(p_curr) - np.array(p_prev)) * mpp / dt
 
-# =============================
-# MAIN VIDEO PIPELINE
-# =============================
-def main(video_path):
+def time_to_collision(p1, v1, p2, v2, mpp):
+    dp = (np.array(p2) - np.array(p1)) * mpp
+    dv = v2 - v1
+    dv_norm = np.dot(dv, dv)
+    if dv_norm < 1e-6:
+        return np.inf
+    ttc = -np.dot(dp, dv) / dv_norm
+    return ttc if ttc > 0 else np.inf
+
+def post_encroachment_time(path1, path2, fps):
+    if len(path1) < 2 or len(path2) < 2:
+        return np.inf
+    min_dist = np.inf
+    i_min = j_min = 0
+    for i, p1 in enumerate(path1):
+        for j, p2 in enumerate(path2):
+            d = math.dist(p1, p2)
+            if d < min_dist:
+                min_dist = d
+                i_min, j_min = i, j
+    return abs(i_min - j_min) / fps
+
+# ======================================================
+# VIDEO PROCESSING
+# ======================================================
+def process_video(video_path):
     model = YOLO("yolov8n.pt")
 
     cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print("ERROR: Cannot open video")
-        return
-
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+    out_path = "output.mp4"
     out = cv2.VideoWriter(
-        OUTPUT_VIDEO,
+        out_path,
         cv2.VideoWriter_fourcc(*"mp4v"),
         fps,
         (w, h)
     )
 
-    trajectories = defaultdict(list)
+    trajectories = defaultdict(lambda: deque(maxlen=30))
     near_miss_events = []
     event_id = 1
-    frame_idx = 0
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -87,91 +94,92 @@ def main(video_path):
         results = model.track(
             frame,
             persist=True,
-            conf=CONF_THRESH,
-            classes=VEHICLE_CLASSES
+            classes=[2, 3, 5, 7]  # vehicles
         )
 
-        detections = []
-
-        # =============================
-        # TRACKING + DRAWING
-        # =============================
+        ids = []
         if results and results[0].boxes.id is not None:
             boxes = results[0].boxes.xyxy.cpu().numpy()
-            ids = results[0].boxes.id.cpu().numpy()
+            track_ids = results[0].boxes.id.cpu().numpy()
 
-            for box, oid in zip(boxes, ids):
+            for box, oid in zip(boxes, track_ids):
                 x1, y1, x2, y2 = map(int, box)
-                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                cx, cy = (x1+x2)//2, (y1+y2)//2
 
                 trajectories[oid].append((cx, cy))
-                detections.append((oid, (cx, cy)))
+                ids.append(oid)
 
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                cv2.putText(frame, f"id:{int(oid)}",
-                            (x1, y1 - 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5,
-                            (0, 0, 255), 2)
+                cv2.rectangle(frame, (x1,y1), (x2,y2), (0,0,255), 2)
+                cv2.putText(frame, f"id:{int(oid)}", (x1,y1-5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
 
                 for i in range(1, len(trajectories[oid])):
                     cv2.line(frame,
-                             trajectories[oid][i - 1],
+                             trajectories[oid][i-1],
                              trajectories[oid][i],
-                             (0, 255, 0), 2)
+                             (0,255,0), 2)
 
-        # =============================
-        # NEAR-MISS DETECTION
-        # =============================
-        for i in range(len(detections)):
-            id1, p1 = detections[i]
-            for j in range(i + 1, len(detections)):
-                id2, p2 = detections[j]
-                dist = math.dist(p1, p2)
+        for i in range(len(ids)):
+            for j in range(i+1, len(ids)):
+                id1, id2 = ids[i], ids[j]
+                if len(trajectories[id1]) < 2 or len(trajectories[id2]) < 2:
+                    continue
 
-                if dist < NEAR_MISS_DIST:
-                    ttc = dist / fps
-                    if ttc < TTC_THRESHOLD:
-                        event = {
-                            "id": event_id,
-                            "safety_indicator": round(ttc, 2),
-                            "traj_1": "car",
-                            "traj_2": "car",
-                            "time": time.strftime("%H:%M:%S")
-                        }
-                        near_miss_events.append(event)
-                        event_id += 1
+                p1_now, p1_prev = trajectories[id1][-1], trajectories[id1][-2]
+                p2_now, p2_prev = trajectories[id2][-1], trajectories[id2][-2]
 
-                        cv2.line(frame, p1, p2, (0, 0, 255), 2)
-                        cv2.putText(frame, "NEAR MISS",
-                                    ((p1[0] + p2[0]) // 2,
-                                     (p1[1] + p2[1]) // 2),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.6, (0, 0, 255), 2)
+                v1 = velocity(p1_prev, p1_now, 1/fps, meters_per_pixel)
+                v2 = velocity(p2_prev, p2_now, 1/fps, meters_per_pixel)
 
-        # =============================
-        # DRAW TABLE PANEL
-        # =============================
-        draw_near_miss_panel(frame, near_miss_events)
+                ttc = time_to_collision(p1_now, v1, p2_now, v2, meters_per_pixel)
+                pet = post_encroachment_time(trajectories[id1], trajectories[id2], fps)
+
+                if ttc < ttc_threshold or pet < pet_threshold:
+                    near_miss_events.append({
+                        "ID": event_id,
+                        "TTC (s)": round(ttc, 2),
+                        "PET (s)": round(pet, 2),
+                        "Vehicle 1": "car",
+                        "Vehicle 2": "car",
+                        "Time": time.strftime("%H:%M:%S")
+                    })
+                    event_id += 1
+
+                    cv2.line(frame, p1_now, p2_now, (0,0,255), 2)
+                    cv2.putText(frame, "NEAR MISS",
+                                ((p1_now[0]+p2_now[0])//2,
+                                 (p1_now[1]+p2_now[1])//2),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
 
         out.write(frame)
-        frame_idx += 1
 
     cap.release()
     out.release()
 
-    pd.DataFrame(near_miss_events).to_csv(OUTPUT_CSV, index=False)
+    return out_path, pd.DataFrame(near_miss_events)
 
-    print("DONE")
-    print(f"Video saved: {OUTPUT_VIDEO}")
-    print(f"Events saved: {OUTPUT_CSV}")
-    print(f"Total near-miss events: {len(near_miss_events)}")
+# ======================================================
+# RUN PIPELINE
+# ======================================================
+if uploaded_video and run_button:
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp.write(uploaded_video.read())
+        video_path = tmp.name
 
-# =============================
-# ENTRY POINT
-# =============================
-if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: python app.py input_video.mp4")
-        sys.exit(1)
+    with st.spinner("Processing video…"):
+        out_video, df = process_video(video_path)
 
-    main(sys.argv[1])
+    st.success("Processing complete")
+
+    st.header("Processed Video")
+    st.video(out_video)
+
+    st.header("Near-Miss Events")
+    if len(df) > 0:
+        st.dataframe(df, use_container_width=True)
+
+        col1, col2 = st.columns(2)
+        col1.metric("Total Near Misses", len(df))
+        col2.metric("Avg TTC (s)", round(df["TTC (s)"].mean(), 2))
+    else:
+        st.info("No near-miss events detected.")
